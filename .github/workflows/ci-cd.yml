@@ -1,0 +1,205 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    name: Lint & Test - Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run unit tests
+        run: npm test
+
+  security-scan:
+    name: Security Scan
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run npm audit
+        run: npm audit --audit-level=high
+
+      - name: Build Docker image
+        run: docker build -t web2-app:security-scan .
+
+      - name: Run Trivy container scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: web2-app:security-scan
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+  build-and-publish:
+    name: Build & Push Docker Image to ECR
+    needs: security-scan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: ap-southeast-1
+      ECR_REGISTRY: 992382472679.dkr.ecr.ap-southeast-1.amazonaws.com
+      ECR_REPOSITORY: alfianmi-bootcamp-app
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::992382472679:role/github-actions-ecr-deploy-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to EC2
+    needs: build-and-publish
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      AWS_REGION: ap-southeast-1
+      ECR_REGISTRY: 992382472679.dkr.ecr.ap-southeast-1.amazonaws.com
+      ECR_REPOSITORY: alfianmi-bootcamp-app
+
+    steps:
+      - name: Prepare SSH key
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+      - name: Add EC2 host to known_hosts
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy application
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          ssh -i ~/.ssh/ec2_key \
+            ec2-user@"$EC2_HOST" << EOF
+              set -e
+
+              aws ecr get-login-password \
+                --region ${AWS_REGION} | \
+              docker login \
+                --username AWS \
+                --password-stdin ${ECR_REGISTRY}
+
+              docker pull \
+                ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+              docker rm -f bootcamp-app 2>/dev/null || true
+
+              docker run -d \
+                --name bootcamp-app \
+                --restart unless-stopped \
+                -p 80:3000 \
+                ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+              docker image prune -f
+          EOF
+
+  smoke-test:
+    name: Smoke Test
+    needs: deploy
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run smoke test
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          chmod +x scripts/smoke-test.sh
+          ./scripts/smoke-test.sh "http://${EC2_HOST}/health"
+
+  release:
+    name: Create GitHub Release
+    needs: smoke-test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Release v1.0.${{ github.run_number }}
+          generate_release_notes: true

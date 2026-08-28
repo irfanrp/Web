@@ -1,5 +1,7 @@
 FROM node:18-alpine AS dependencies
 
+RUN apk update && apk upgrade
+
 WORKDIR /app
 
 COPY package*.json ./
@@ -8,6 +10,13 @@ RUN npm ci --omit=dev
 
 
 FROM node:18-alpine
+
+RUN apk update && apk upgrade
+
+# npm tidak dibutuhkan saat runtime
+RUN rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/lib/node_modules/corepack \
+           /opt/yarn-v1.22.22
 
 WORKDIR /app
 
